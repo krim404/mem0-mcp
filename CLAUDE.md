@@ -1,0 +1,41 @@
+# mem0-mcp — agent notes
+
+Standalone repo for a self-hosted agent-memory MCP bridge and its `shared-memory` skill.
+Code, comments, and docs in English.
+
+## What this is
+- `src/index.ts` — stdio MCP server (`mem0-bridge-mcp`), exposes `memory_add/search/list/update/delete/reset`.
+- `src/mem0.ts` — REST client for the mem0 OSS server (scoping, recency re-rank, timeouts).
+- `src/rewrite.ts` — HyDE-lite query rewrite via any OpenAI-compatible chat endpoint (best-effort).
+- `src/selftest.ts` — live smoke test. `src/retrieval-eval.ts` — hit@k probe for question queries.
+- `skills/shared-memory/SKILL.md` — the discipline skill, symlinked into agent skill dirs.
+
+## Architecture
+Bridge (Bun, local, stdio) → a self-hosted mem0 OSS server (FastAPI + pgvector), set via
+`MEM0_API_URL` / `MEM0_API_KEY`. An OpenAI-compatible LLM + embedder back the server; the bridge's
+rewriter uses `MEM0_REWRITE_BASE_URL` / `MEM0_REWRITE_MODEL`. Scoping via mem0 `run_id`: project
+(git-derived) + global. Search merges both and re-ranks by recency-weighted score.
+
+## Key behaviors
+- **infer:true** (default, `MEM0_INFER=0` to disable): the server extracts the fact and reconciles
+  it against existing memories (ADD/UPDATE/DELETE/NONE) — dedupe + auto-invalidation of contradicted
+  facts. `add` returns one hit per event; adds use a 45s timeout (two LLM calls).
+- **HyDE-lite** (`MEM0_QUERY_REWRITE=1`, needs `MEM0_REWRITE_BASE_URL`+`MEM0_REWRITE_MODEL`):
+  question queries are rewritten to a declarative statement and searched alongside the raw query.
+  Failure or missing config degrades to the raw query.
+- **Recency re-rank**: `score * (0.6 + 0.4*exp(-ln2*ageDays/90))` in `mem0.ts`. Tie-breaker, not a
+  guillotine.
+- **Storage doctrine**: one self-contained declarative fact per entry, name the subject, never a
+  bare value. Do NOT store the question (the model handles question/answer asymmetry at query time).
+
+## Server-side note
+For fact extraction to keep technical detail (paths, hostnames, versions) instead of rewriting into
+third-person prose, set a `custom_instructions` prompt on the mem0 server. That is server-side
+configuration, outside this repo. Deployment specifics for a given environment do not belong in the
+committed tree; keep them in an untracked local file.
+
+## Conventions
+- TypeScript/Bun, no Python. Deps in `package.json` / `bun.lock`; `bun install` before running.
+- Keep the tool surface small (6 tools); every tool schema costs context tokens.
+- Never store secrets in memory. `memory_reset` needs the user's token — never invent one.
+- No em/en dashes in prose. Short one-sentence commit messages, no prefixes, no generated-by trailers.

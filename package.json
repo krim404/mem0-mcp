@@ -1,0 +1,19 @@
+{
+  "name": "mem0-bridge-mcp",
+  "type": "module",
+  "version": "0.5.0",
+  "description": "Thin stdio MCP server exposing a self-hosted mem0 OSS server as project-scoped memory tools.",
+  "license": "MIT",
+  "bin": {
+    "mem0-bridge-mcp": "src/index.ts"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
+  }
+}
