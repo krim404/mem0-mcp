@@ -1,6 +1,6 @@
 ---
 name: shared-memory
-description: Use when starting any non-trivial task (recall prior context first) or after making a decision, learning a durable fact, or hitting a gotcha (store it). Triggers the shared mem0 memory MCP tools memory_search and memory_add.
+description: "Use when starting any non-trivial task (recall prior context first) or after making a decision, learning a durable fact, or hitting a gotcha (store it). This is the shared cross-agent memory: the mem0 MCP tools memory_search / memory_add (mcp__mem0__*). It applies in EVERY project regardless of repo wiring or a project CLAUDE.md. This is NOT the agent's built-in file-based memory: to recall or store here, never use the Write tool, never create or edit markdown under a .claude memory directory, and never touch MEMORY.md."
 ---
 
 # shared-memory
@@ -9,6 +9,29 @@ description: Use when starting any non-trivial task (recall prior context first)
 A shared memory lives in a mem0 MCP (`memory_search` / `memory_add`), auto-scoped to the current
 project so recall stays relevant. Core principle: **recall before you re-derive, remember what
 will matter next time.** Memory is optional; if it is unavailable, proceed and never block.
+
+## This is the mem0 MCP, not the file-based memory
+**Read this before you store or recall anything.** `memory_search` and `memory_add` are **MCP
+tool calls** (`mcp__mem0__memory_search`, `mcp__mem0__memory_add`, and the other `mcp__mem0__*`
+tools). You invoke them through the tool-call mechanism, exactly like any other tool.
+
+The shared memory does **not** live in files. When this skill says recall or store, that means a
+mem0 MCP tool call and nothing else:
+- **Never** use the Write tool to record a memory.
+- **Never** create or edit a markdown file under any `.claude/**/memory/` path.
+- **Never** add or update an entry in `MEMORY.md`.
+- **Never** read those files to "recall"; recall is a `memory_search` tool call.
+
+The agent's built-in file-based memory (per-agent markdown files + a `MEMORY.md` index) is a
+**separate, local-only feature**. It is not this skill, and other agents cannot see it. This skill
+is the one shared store every agent reads and writes. If both seem to apply to "remembering," this
+one governs the shared memory; route the fact here via the MCP tools.
+
+**This skill applies in every project.** It does not need any repo wiring, mem0 config, or a
+project `CLAUDE.md` to be in effect. The only precondition is that the `mem0` MCP tools are
+reachable. A generic project with no memory docs is still a project where you use these tools. The
+absence of mem0 wiring in a repo is **not** a reason to fall back to the file-based memory; it is
+only a reason to skip memory entirely if the MCP tools genuinely error.
 
 ## When to use
 - **Before** a non-trivial task: `memory_search` the topic to reuse prior decisions, conventions,
@@ -86,7 +109,19 @@ catch on its own:
 Note: `memory_list` returns a server-capped page, not the full store; use `memory_search`
 for recall. If a memory tool errors, continue the task without memory.
 
+## Red flags: you are about to use the wrong memory
+Stop if you catch yourself doing any of these; route to the mem0 MCP tools instead.
+- Reaching for the **Write tool** to save a fact, or picking a `.md` file path for it.
+- Editing `MEMORY.md` or a file under `.claude/**/memory/` to record something.
+- Thinking "this project has no mem0 wiring, so the skill does not apply"; it applies whenever
+  the `mem0` tools are reachable, wiring or not.
+- Thinking "file memory is my default, I'll use mem0 only if told"; for the shared memory the
+  mem0 MCP is the default and the only store; the file memory is a different thing.
+- "Reading" old memory files to recall; recall is a `memory_search` tool call.
+
 ## Common mistakes
+- Writing a markdown memory file (or a `MEMORY.md` line) instead of calling `memory_add`. That
+  lands in the local file memory no other agent can see; call the `mcp__mem0__memory_add` tool.
 - Skipping the pre-task recall, then re-deriving something already decided.
 - Storing a bare value with no subject (`registry.example.com`) — meaningless and unfindable later.
 - Storing session-transient state ("X not implemented yet") instead of the final fact.
