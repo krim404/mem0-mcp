@@ -34,10 +34,20 @@ absence of mem0 wiring in a repo is **not** a reason to fall back to the file-ba
 only a reason to skip memory entirely if the MCP tools genuinely error.
 
 ## When to use
+- **At the START of a task**: call `memory_pins` to load standing hard facts / instructions
+  (AGENTS.md-like context that must always apply), before anything else.
 - **Before** a non-trivial task: `memory_search` the topic to reuse prior decisions, conventions,
-  and gotchas instead of re-discovering them.
-- **After** a decision, a durable fact, or a gotcha: `memory_add` it, short and specific.
-- Not for transient chatter, secrets, or unpublished sensitive data.
+  and gotchas instead of re-discovering them. With no specific query (recovering context),
+  use `memory_recent` for the last N entries.
+- **After essentially every insight** — save VERY often, not just at the end. `memory_add` both
+  hard facts (root causes, fixes, configs, decisions) AND soft/personal ones (user preferences,
+  tone, conventions — e.g. "the user dislikes being called Wurstbrot"). Don't worry about
+  duplicates: the server dedups and reconciles on add. Keep each entry one self-contained fact.
+- **Never** store transient/ephemeral states or moods (e.g. "I'm tired", "don't want to talk
+  right now"), transient chatter, secrets, or unpublished sensitive data. Durable facts and
+  lasting preferences only.
+- Three retrieval modes, kept distinct: `memory_search` = relevance, `memory_recent` = newest,
+  `memory_list` = raw inspection.
 
 ## Quick reference
 | Action | Tool | Default scope |
@@ -47,7 +57,12 @@ only a reason to skip memory entirely if the MCP tools genuinely error.
 | Recall everything | `memory_search(query, scope="all")` | all projects |
 | Store project fact | `memory_add(text)` | current project |
 | Store cross-project fact | `memory_add(text, scope="global")` | global |
+| Store/recall in a named namespace | `memory_add(text, key="<id>")` / `memory_search(query, key="<id>")` | exactly `<id>` |
 | Inspect a scope | `memory_list(scope?, limit?)` | current project |
+| Recent entries (by time) | `memory_recent(limit?)` | most recent first |
+| Load always-on hard facts | `memory_pins()` | global + local pins |
+| Pin an always-on hard fact | `memory_pin(text, scope?)` | `local` (default) or `global` |
+| Remove a pin | `memory_unpin(memory_id)` | by UUID |
 | Fix a stale/wrong fact | `memory_update(memory_id, text)` | by UUID |
 | Remove a fact | `memory_delete(memory_id)` | by UUID |
 | Wipe the whole store | `memory_reset(reset_token)` | ALL projects, irreversible |
@@ -55,6 +70,28 @@ only a reason to skip memory entirely if the MCP tools genuinely error.
 `memory_reset` erases everything across all projects. It only works with the user's secret
 reset token: always ask the user for the token first and confirm they really want the wipe.
 Never guess or reuse a token, and never call reset on your own initiative.
+
+## Namespace key (per-context scoping)
+Every read/write tool takes an optional `key`. When set, it pins the operation to exactly that
+namespace and overrides `scope` — use it to keep contexts fully separate, e.g. one Matrix room's
+notes from another's. Recall with the same `key` you stored with:
+`memory_add(text, key="!room:server")`, `memory_search(query, key="!room:server")`. When your
+context tells you which key to use (for example a room persona that names the key), always pass it.
+The server can also be started with `MEM0_SCOPE_KEY` to force a single key for every call without
+passing it explicitly. Leave `key` unset for normal project/global scoping.
+
+## Pinned hard facts (always loaded)
+Most memories surface only when semantically relevant to a search. A **pin** is different: it is a
+hard, standing fact or instruction that must be loaded on EVERY task, like reading an `AGENTS.md`.
+- **Load pins at the start of a task** with `memory_pins()` — it returns the global pins plus the
+  local pins for the current namespace. Do this before `memory_search`, as the first step.
+- **Pin** with `memory_pin(text)`: stored verbatim (never reworded or reconciled), kept out of
+  normal search/list, never decayed. `scope="local"` (default) applies to this room/project;
+  `scope="global"` applies everywhere. Pinning the same text twice is a no-op (deduped).
+- Use a pin for a rule that must never be missed (a hard constraint, a persona instruction, a
+  standing convention). Use a normal `memory_add` for an ordinary fact that only matters when the
+  topic comes up. When in doubt, `memory_add` — pins are always-on context and cost tokens every load.
+- Remove an obsolete pin with `memory_unpin(memory_id)` (the id shown by `memory_pins`).
 
 ## Writing memories that can be found again
 Store **one self-contained declarative fact** per entry. The embedding model matches a future

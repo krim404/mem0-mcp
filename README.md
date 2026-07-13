@@ -16,6 +16,14 @@ The bridge talks to any self-hosted mem0 OSS server (FastAPI + Postgres/pgvector
 **project** scope (git remote repo name, else git top-level / cwd) plus a reserved **global** scope
 for cross-project facts. Default search merges project + global.
 
+The project id is the repo **basename** (portable across clones and machines), so it deliberately
+drops the owner: two repos with the same name from different owners (`orgA/api`, `orgB/api`) share
+one project scope. Use the `global` scope or an explicit `key` if that collision matters.
+
+Setting `MEM0_SCOPE_KEY` (or passing `key` per call) pins every operation to that one namespace and
+**overrides** `scope`: with a scope key active, `project`, `global`, and `all` all resolve to the
+key. This is the room-scoped deployment mode (e.g. one memory namespace per chat room / session).
+
 For the reconcile-on-add and question-rewrite features the server needs an LLM and an embedder
 (any OpenAI-compatible endpoint). To keep fact extraction from rewriting technical facts into
 third-person prose, set a `custom_instructions` prompt on the mem0 server (see mem0 docs).
@@ -26,9 +34,17 @@ third-person prose, set a `custom_instructions` prompt on the mem0 server (see m
 | `memory_add(text, scope?)` | store one durable fact; mem0 extracts + reconciles it (dedupe / update / delete), result reports what changed |
 | `memory_search(query, scope?, limit?)` | semantic recall (`project` = project + global merged, `global`, `all`) |
 | `memory_list(scope?, limit?)` | list a scope (server caps the page; use search for recall) |
+| `memory_recent(scope?, limit?)` | most recent entries first (time-based), for recovering recent context with no query |
+| `memory_pin(text, scope?)` | pin a hard, always-load fact (AGENTS.md-like), verbatim and deduped; `local` (default) or `global` |
+| `memory_pins()` | return all pins that apply now (global + local); call at the start of a task |
+| `memory_unpin(memory_id)` | remove a pin by UUID |
 | `memory_update(memory_id, text)` | rewrite one memory by UUID |
 | `memory_delete(memory_id)` | delete one memory by UUID; no bulk delete exposed |
 | `memory_reset(reset_token)` | irreversibly wipe the whole store; token-gated (see below) |
+
+**Pins** live in dedicated namespaces (`pins:global`, `pins:<local>`), stored verbatim
+(`infer:false`), kept out of normal search/list, and never decayed. They are for standing context
+that must surface on every load, not just when semantically relevant. `memory_reset` wipes them too.
 
 Destructive safety: `memory_id` is validated as a UUID before any request, and redirects are never
 followed (a trailing-slash 307 could otherwise reroute a DELETE onto the server's delete-all route).

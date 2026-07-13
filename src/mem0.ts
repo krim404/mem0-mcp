@@ -15,10 +15,13 @@ export type Scope = "project" | "global" | "all";
 export const GLOBAL_SCOPE = "global";
 
 const REQUEST_TIMEOUT_MS = 10_000;
-// Adds run mem0's extract + reconcile pipeline (two LLM calls under infer:true), so they need a
+// An add runs mem0's extract + reconcile pipeline (two LLM calls under infer:true), so it needs a
 // longer budget than a plain vector read/write.
 const ADD_TIMEOUT_MS = 45_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Per (scope, query) request we fetch `limit + this` rows, then merge/re-rank/trim to `limit` once,
+// so a borderline hit that recency re-rank would promote is not lost at the per-request boundary.
+const SEARCH_OVERFETCH = 5;
 
 // Recency re-rank: a matching memory's score is scaled by how recently it was written, so a
 // stale hit sinks below a comparable fresh one. Decay is a tie-breaker, not a guillotine -- the
@@ -64,6 +67,7 @@ export interface Mem0Config {
   project: string;       // auto-detected project id (run_id)
   insecureTls?: boolean; // skip TLS verify for self-signed certs; prefer NODE_EXTRA_CA_CERTS
   infer?: boolean;       // let mem0 extract + reconcile facts on add (default true); false = store verbatim
+  scopeKey?: string;     // explicit namespace override (e.g. a Matrix room id); from MEM0_SCOPE_KEY
 }
 
 export interface MemoryHit {
@@ -87,8 +91,15 @@ function recencyFactor(iso?: string): number {
 export class Mem0Client {
   constructor(private readonly cfg: Mem0Config) {}
 
-  /** The run_id to use for a scope. `all` returns undefined (no run scope = everything). */
-  private runId(scope: Scope): string | undefined {
+  /**
+   * The run_id to use for a scope. An explicit `key` (per-call arg, else the configured
+   * `scopeKey`) overrides everything and pins storage/recall to that namespace — this is
+   * how a Matrix room id scopes memory. Otherwise: `all` -> undefined (everything),
+   * `global` -> the reserved global scope, `project` -> the auto-detected project.
+   */
+  private runId(scope: Scope, key?: string): string | undefined {
+    const k = key ?? this.cfg.scopeKey;
+    if (k) return k;
     if (scope === "all") return undefined;
     if (scope === "global") return GLOBAL_SCOPE;
     return this.cfg.project;
@@ -137,13 +148,13 @@ export class Mem0Client {
    * its own. Set infer=false (MEM0_INFER=0) to store the text verbatim without that pipeline.
    * Returns one hit per reconciliation event so the caller can see what changed.
    */
-  async add(text: string, scope: Scope = "project"): Promise<MemoryHit[]> {
+  async add(text: string, scope: Scope = "project", key?: string): Promise<MemoryHit[]> {
     const body: Record<string, unknown> = {
       messages: [{ role: "user", content: text }],
       user_id: this.cfg.defaultUserId,
       infer: this.cfg.infer ?? true,
     };
-    const run = this.runId(scope === "all" ? "project" : scope); // never add without a scope
+    const run = this.runId(scope === "all" ? "project" : scope, key); // never add without a scope
     if (run) body.run_id = run;
     const data = await this.request("/memories", { method: "POST", body: JSON.stringify(body) }, ADD_TIMEOUT_MS);
     return Mem0Client.toHits(data);
@@ -156,8 +167,14 @@ export class Mem0Client {
     return Mem0Client.toHits(data);
   }
 
-  /** The run scopes a search fans out over: 'project' spans project + global, others map 1:1. */
-  private searchRunIds(scope: Scope): (string | undefined)[] {
+  /**
+   * The run scopes a search fans out over. An explicit `key` (per-call, else configured
+   * `scopeKey`) pins the search to that single namespace. Otherwise: 'project' spans
+   * project + global, others map 1:1.
+   */
+  private searchRunIds(scope: Scope, key?: string): (string | undefined)[] {
+    const k = key ?? this.cfg.scopeKey;
+    if (k) return [k];
     if (scope === "all") return [undefined];
     if (scope === "global") return [GLOBAL_SCOPE];
     return [this.cfg.project, GLOBAL_SCOPE];
@@ -176,12 +193,14 @@ export class Mem0Client {
     scope: Scope = "project",
     limit = 5,
     extraQueries: string[] = [],
+    key?: string,
   ): Promise<MemoryHit[]> {
     const queries = [query, ...extraQueries];
-    const runIds = this.searchRunIds(scope);
-    // Widen the per-request cap: N queries x M scopes each fetch `limit`, then we re-rank and trim
-    // once, so a hit ranked just outside a single request can still make the final top-k.
-    const perRequest = limit;
+    const runIds = this.searchRunIds(scope, key);
+    // Widen the per-request cap so a hit ranked just outside the final top-k in one (scope, query)
+    // request can still win after the union is re-ranked: each of the N queries x M scopes fetches
+    // more than `limit`, then we merge, recency-re-rank, and trim to `limit` once.
+    const perRequest = limit + SEARCH_OVERFETCH;
     const batches = await Promise.all(
       runIds.flatMap((runId) => queries.map((q) => this.searchScope(q, runId, perRequest))),
     );
@@ -189,9 +208,9 @@ export class Mem0Client {
     // Dedupe across queries/scopes, keeping the highest raw score seen for each memory.
     const best = new Map<string, MemoryHit>();
     for (const hit of batches.flat()) {
-      const key = hit.id ?? hit.memory;
-      const prev = best.get(key);
-      if (!prev || (hit.score ?? 0) > (prev.score ?? 0)) best.set(key, hit);
+      const dedupKey = hit.id ?? hit.memory;
+      const prev = best.get(dedupKey);
+      if (!prev || (hit.score ?? 0) > (prev.score ?? 0)) best.set(dedupKey, hit);
     }
 
     return [...best.values()]
@@ -202,14 +221,80 @@ export class Mem0Client {
       .slice(0, limit);
   }
 
-  /** List memories for a scope. The server caps the page size; use search for recall. */
-  async list(scope: Scope = "project", limit?: number): Promise<MemoryHit[]> {
+  /**
+   * List memories for a scope. By default returns the server's page order (for inspection).
+   * With `recent: true` it returns MOST RECENT FIRST — for time-based retrieval like "the
+   * last N entries". For finding what best matches a topic, use `search`, not this.
+   */
+  async list(scope: Scope = "project", limit?: number, key?: string, recent = false): Promise<MemoryHit[]> {
     const params = new URLSearchParams({ user_id: this.cfg.defaultUserId });
-    const run = this.runId(scope);
+    const run = this.runId(scope, key);
     if (run) params.set("run_id", run);
-    if (limit !== undefined) params.set("top_k", String(limit));
+    // For recency mode fetch a generous page then sort+trim locally (server order is not chronological).
+    if (limit !== undefined) params.set("top_k", String(recent ? Math.max(limit * 4, 50) : limit));
     const data = await this.request(`/memories?${params.toString()}`, { method: "GET" });
+    const hits = Mem0Client.toHits(data);
+    if (!recent) return hits;
+    hits.sort((a, b) => Mem0Client.tsOf(b) - Mem0Client.tsOf(a));
+    return limit !== undefined ? hits.slice(0, limit) : hits;
+  }
+
+  /** Epoch ms of a hit's most recent timestamp (0 when absent). */
+  private static tsOf(h: MemoryHit): number {
+    const t = Date.parse(h.updatedAt ?? h.createdAt ?? "");
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  // ── Pinned facts (AGENTS.md-like: always loaded, verbatim, kept out of normal recall) ──────
+  //
+  // Pins live in dedicated namespaces so they never pollute semantic search/list and are never
+  // decayed or reconciled: `pins:global` (cross-scope) and `pins:<key>` (local to a room/project).
+  // They are stored verbatim (infer:false) so the exact text is preserved.
+
+  /** The run_id holding pins for a scope. */
+  private pinRun(scope: "global" | "local", key?: string): string {
+    if (scope === "global") return "pins:global";
+    const k = key ?? this.cfg.scopeKey ?? this.cfg.project;
+    return `pins:${k}`;
+  }
+
+  /**
+   * Add a pinned fact verbatim (never inferred/reconciled). Deduped: since pins are stored exactly
+   * as written and loaded on every recall, an identical pin (same trimmed text) already in the run
+   * is returned as-is instead of creating a second copy. Returns the stored (or existing) hits.
+   */
+  async addPin(text: string, scope: "global" | "local", key?: string): Promise<MemoryHit[]> {
+    const runId = this.pinRun(scope, key);
+    const wanted = text.trim();
+    const params = new URLSearchParams({ user_id: this.cfg.defaultUserId, run_id: runId, top_k: "200" });
+    const existing = Mem0Client.toHits(await this.request(`/memories?${params.toString()}`, { method: "GET" }));
+    const dup = existing.find((h) => h.memory.trim() === wanted);
+    if (dup) return [dup];
+
+    const body = {
+      messages: [{ role: "user", content: text }],
+      user_id: this.cfg.defaultUserId,
+      infer: false, // pins are kept exactly as written
+      run_id: runId,
+      metadata: { pinned: true },
+    };
+    // infer:false is a single verbatim write (no LLM), so the standard request timeout is enough.
+    const data = await this.request("/memories", { method: "POST", body: JSON.stringify(body) });
     return Mem0Client.toHits(data);
+  }
+
+  /**
+   * All pinned facts that apply right now: the global pins plus the local pins for `key`
+   * (or the configured scopeKey / project). Returned in full — this is the always-load set.
+   */
+  async listPins(key?: string): Promise<{ global: MemoryHit[]; local: MemoryHit[] }> {
+    const fetchRun = async (runId: string): Promise<MemoryHit[]> => {
+      const params = new URLSearchParams({ user_id: this.cfg.defaultUserId, run_id: runId, top_k: "200" });
+      const data = await this.request(`/memories?${params.toString()}`, { method: "GET" });
+      return Mem0Client.toHits(data);
+    };
+    const [global, local] = await Promise.all([fetchRun("pins:global"), fetchRun(this.pinRun("local", key))]);
+    return { global, local };
   }
 
   /** Rewrite the text of one memory by id. */

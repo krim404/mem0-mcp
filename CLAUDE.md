@@ -4,7 +4,7 @@ Standalone repo for a self-hosted agent-memory MCP bridge and its `shared-memory
 Code, comments, and docs in English.
 
 ## What this is
-- `src/index.ts` — stdio MCP server (`mem0-bridge-mcp`), exposes `memory_add/search/list/update/delete/reset`.
+- `src/index.ts` — stdio MCP server (`mem0-bridge-mcp`), exposes `memory_add/search/list/recent`, the pin trio `memory_pin/pins/unpin`, and `memory_update/delete/reset`.
 - `src/mem0.ts` — REST client for the mem0 OSS server (scoping, recency re-rank, timeouts).
 - `src/rewrite.ts` — HyDE-lite query rewrite via any OpenAI-compatible chat endpoint (best-effort).
 - `src/selftest.ts` — live smoke test. `src/retrieval-eval.ts` — hit@k probe for question queries.
@@ -36,6 +36,6 @@ committed tree; keep them in an untracked local file.
 
 ## Conventions
 - TypeScript/Bun, no Python. Deps in `package.json` / `bun.lock`; `bun install` before running.
-- Keep the tool surface small (6 tools); every tool schema costs context tokens.
+- Keep the tool surface lean (10 tools: add/search/list/recent, pin/pins/unpin, update/delete/reset); every tool schema costs context tokens, so add a tool only when a distinct retrieval/write mode justifies it.
 - Never store secrets in memory. `memory_reset` needs the user's token — never invent one.
 - No em/en dashes in prose. Short one-sentence commit messages, no prefixes, no generated-by trailers.
