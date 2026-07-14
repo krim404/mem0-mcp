@@ -39,15 +39,37 @@ only a reason to skip memory entirely if the MCP tools genuinely error.
 - **Before** a non-trivial task: `memory_search` the topic to reuse prior decisions, conventions,
   and gotchas instead of re-discovering them. With no specific query (recovering context),
   use `memory_recent` for the last N entries.
-- **After essentially every insight** — save VERY often, not just at the end. `memory_add` both
+- **After essentially every insight** save VERY often, not just at the end. `memory_add` both
   hard facts (root causes, fixes, configs, decisions) AND soft/personal ones (user preferences,
-  tone, conventions — e.g. "the user dislikes being called Wurstbrot"). Don't worry about
+  tone, conventions, e.g. "the user dislikes being called Wurstbrot"). Don't worry about
   duplicates: the server dedups and reconciles on add. Keep each entry one self-contained fact.
 - **Never** store transient/ephemeral states or moods (e.g. "I'm tired", "don't want to talk
   right now"), transient chatter, secrets, or unpublished sensitive data. Durable facts and
   lasting preferences only.
 - Three retrieval modes, kept distinct: `memory_search` = relevance, `memory_recent` = newest,
   `memory_list` = raw inspection.
+
+## Chat vs. code: pick the cadence for the context
+Read the working context (the persona/agent usually declares it: a conversational chat assistant
+vs. a code/repair/task agent) and match how eagerly you use memory.
+
+- **Chat / conversational context** (a chat assistant talking to a person): memory IS the product,
+  so lean heavily on it.
+  - **Recall eagerly**: before a substantive reply, `memory_recent` (or `memory_search`) so you
+    keep continuity across messages and never forget what the person already told you.
+  - **Store eagerly, err on the side of MORE**: prefer over-storing to under-storing. The server
+    dedups and reconciles, so a redundant add is cheap; a fact you failed to save is lost. When in
+    doubt, store it.
+- **Code / task context** (implementing, debugging, refactoring): be targeted. Recall on
+  non-trivial tasks that may build on earlier work; store the durable outcomes (root causes, fixes,
+  configs, decisions). Skip memory for trivial self-contained requests.
+
+## Store triggers: save immediately when
+- The user states a fact about themselves or their identity, role, or environment.
+- The user expresses a lasting preference, convention, or way they want you to work.
+- The user corrects you, or a decision is settled.
+- **Task completion**: when a piece of work is finished, record ONE short summary of what was done
+  (what + outcome/approach) with `memory_add`. Do this ONLY at the very end, once, not mid-task.
 
 ## Quick reference
 | Action | Tool | Default scope |
@@ -73,12 +95,20 @@ Never guess or reuse a token, and never call reset on your own initiative.
 
 ## Namespace key (per-context scoping)
 Every read/write tool takes an optional `key`. When set, it pins the operation to exactly that
-namespace and overrides `scope` — use it to keep contexts fully separate, e.g. one Matrix room's
-notes from another's. Recall with the same `key` you stored with:
-`memory_add(text, key="!room:server")`, `memory_search(query, key="!room:server")`. When your
-context tells you which key to use (for example a room persona that names the key), always pass it.
-The server can also be started with `MEM0_SCOPE_KEY` to force a single key for every call without
-passing it explicitly. Leave `key` unset for normal project/global scoping.
+namespace and overrides `scope`, keeping contexts fully separate (e.g. one Matrix room's notes from
+another's). Recall with the same `key` you stored with:
+`memory_add(text, key="!room:server")`, `memory_search(query, key="!room:server")`.
+
+**Usually you should NOT pass `key`.** When the server is already scope-pinned (started with
+`MEM0_SCOPE_KEY`, e.g. a per-room deployment), scoping is automatic: just call
+`memory_add(text)` / `memory_search(query)` with no `key`, and your notes stay in this context.
+Passing a room key by hand is the common mistake that makes an agent juggle arguments and drop the
+required `text`. Only pass `key` to deliberately target a DIFFERENT namespace than the current one.
+Outside a scope-pinned server, leave `key` unset for normal project/global scoping.
+
+Read-only knowledge scopes: a deployment may also set `MEM0_EXTRA_READ_SCOPES` so recall additionally
+searches other namespaces (shared knowledge). These are read-only: writes still go only to your own
+scope. You do not pass anything for this; it is merged in automatically.
 
 ## Pinned hard facts (always loaded)
 Most memories surface only when semantically relevant to a search. A **pin** is different: it is a
@@ -90,7 +120,13 @@ hard, standing fact or instruction that must be loaded on EVERY task, like readi
   `scope="global"` applies everywhere. Pinning the same text twice is a no-op (deduped).
 - Use a pin for a rule that must never be missed (a hard constraint, a persona instruction, a
   standing convention). Use a normal `memory_add` for an ordinary fact that only matters when the
-  topic comes up. When in doubt, `memory_add` — pins are always-on context and cost tokens every load.
+  topic comes up. When in doubt, `memory_add`: pins are always-on context and cost tokens every load.
+- **What deserves a pin**: something genuinely important and *recurring*, i.e. a fact you keep
+  needing, an identity/standing preference, or a hard rule that must always apply. A one-off detail
+  does not.
+- **Ask before pinning a borderline case**: when the user clearly wants to be remembered but it is
+  unclear whether it is permanent, ask first ("Is this important enough that I should remember it
+  permanently?"). If it is clearly permanent, pin it directly; if clearly transient, store nothing.
 - Remove an obsolete pin with `memory_unpin(memory_id)` (the id shown by `memory_pins`).
 
 ## Writing memories that can be found again
@@ -142,6 +178,10 @@ catch on its own:
 - **A fact changed during this run** (your task moved an endpoint or convention): add the new fact;
   if you can already see the stale entry, fix it directly rather than leaving a contradiction to be
   reconciled later.
+- **The user contradicts a stored memory** (e.g. "that's not right", "it's not that important to
+  me"): treat it as an authoritative correction. `memory_search` for the offending entry, then
+  `memory_update` it to the corrected fact, or `memory_delete` it. **When in doubt, overwrite or
+  delete** rather than leave a wrong or overweighted memory standing.
 
 Note: `memory_list` returns a server-capped page, not the full store; use `memory_search`
 for recall. If a memory tool errors, continue the task without memory.

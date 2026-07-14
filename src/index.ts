@@ -13,6 +13,11 @@
  * MEM0_QUERY_REWRITE=0 (disable HyDE-lite query rewrite), MEM0_REWRITE_BASE_URL /
  * MEM0_REWRITE_MODEL / MEM0_REWRITE_API_KEY (OpenAI-compatible chat endpoint for the rewriter;
  * rewrite stays off until base URL and model are set).
+ *
+ * Namespace scoping: MEM0_SCOPE_KEY pins every call to one namespace (e.g. a Matrix room id);
+ * MEM0_LOCK_SCOPE=1 makes that key win over any per-call `key` (locked-down deployments, so a
+ * caller can never reach another namespace); MEM0_EXTRA_READ_SCOPES (comma-separated) are extra
+ * namespaces merged into recall only (read, never written).
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -30,8 +35,11 @@ const client = new Mem0Client({
   insecureTls: process.env.MEM0_INSECURE_TLS === "1",
   infer: process.env.MEM0_INFER !== "0", // default on: let mem0 extract + reconcile facts
   scopeKey: process.env.MEM0_SCOPE_KEY || undefined, // pin all ops to one namespace (e.g. a Matrix room id)
-  // Extra read-only scopes merged into every search (comma-separated), e.g. a shared "k8s" knowledge base.
-  extraReadScopes: (process.env.MEM0_EXTRA_READ_SCOPES || "").split(",").map((s) => s.trim()).filter(Boolean),
+  lockScope: process.env.MEM0_LOCK_SCOPE === "1", // force scopeKey over any per-call key (locked-down deployments)
+  extraReadScopes: (process.env.MEM0_EXTRA_READ_SCOPES ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean), // extra read-only namespaces merged into recall
 });
 
 const rewriteCfg = rewriteConfigFromEnv();
@@ -49,7 +57,7 @@ const READ_SCOPE = {
 const KEY_PROP = {
   type: "string",
   description:
-    "Optional namespace key (e.g. a Matrix room id). When set, pins storage/recall to exactly that namespace, overriding `scope`. Leave unset for normal project/global scoping.",
+    "Optional namespace key (e.g. a Matrix room id). When set, pins storage/recall to exactly that namespace, overriding `scope`. Leave unset for normal project/global scoping. When the server already has a scope configured (a room deployment), leave it unset too; only pass it to deliberately target a different namespace.",
 };
 
 const TOOLS = [
@@ -59,7 +67,15 @@ const TOOLS = [
       "Store one durable, self-contained fact/decision in shared memory. mem0 extracts the fact and reconciles it against existing memories (dedupes, updates a contradicted entry); the result reports what changed.",
     inputSchema: {
       type: "object",
-      properties: { text: { type: "string", description: "The fact to remember." }, scope: STORE_SCOPE, key: KEY_PROP },
+      properties: {
+        text: {
+          type: "string",
+          description:
+            "The single self-contained fact to store. This IS the memory content itself, not a namespace/id. REQUIRED and must be non-empty.",
+        },
+        scope: STORE_SCOPE,
+        key: KEY_PROP,
+      },
       required: ["text"],
     },
   },
@@ -150,6 +166,17 @@ const TOOLS = [
   },
 ];
 
+/**
+ * Extract and validate the `text` argument for a write. mem0 stores the memory content from here,
+ * so an empty/missing value is a caller mistake (the model put the fact elsewhere, e.g. in `key`).
+ * Fail loudly instead of silently storing the string "undefined".
+ */
+function requireText(args: Record<string, unknown>): string {
+  const t = String(args.text ?? "").trim();
+  if (!t) throw new Error("nothing stored: `text` is required and must be non-empty; pass the fact itself as `text`.");
+  return t;
+}
+
 /** Compact age of a memory ("<1h", "5h", "3d", "2mo") so staleness is visible at recall time. */
 function formatAge(iso?: string): string {
   const ts = iso ? Date.parse(iso) : NaN;
@@ -198,9 +225,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     switch (name) {
       case "memory_add": {
         const key = args.key ? String(args.key) : undefined;
-        const fact = typeof args.text === "string" ? args.text.trim() : "";
-        if (!fact) { text = "nothing stored: `text` is required and must be non-empty"; break; }
-        const events = await client.add(fact, (args.scope as Scope) ?? "project", key);
+        const events = await client.add(requireText(args), (args.scope as Scope) ?? "project", key);
         text = formatEvents(events);
         break;
       }
@@ -228,8 +253,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "memory_pin": {
         const key = args.key ? String(args.key) : undefined;
         const scope = (args.scope as "global" | "local") ?? "local";
-        const fact = typeof args.text === "string" ? args.text.trim() : "";
-        if (!fact) { text = "nothing pinned: `text` is required and must be non-empty"; break; }
+        const fact = requireText(args);
         const hits = await client.addPin(fact, scope, key);
         text = `pinned (${scope}): ${hits.map((h) => h.memory).filter(Boolean).join(" | ") || fact}`;
         break;
@@ -248,7 +272,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         text = `unpinned ${args.memory_id}`;
         break;
       case "memory_update":
-        await client.update(String(args.memory_id), String(args.text));
+        await client.update(String(args.memory_id), requireText(args));
         text = `updated ${args.memory_id}`;
         break;
       case "memory_delete":

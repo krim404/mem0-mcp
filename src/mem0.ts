@@ -68,7 +68,8 @@ export interface Mem0Config {
   insecureTls?: boolean; // skip TLS verify for self-signed certs; prefer NODE_EXTRA_CA_CERTS
   infer?: boolean;       // let mem0 extract + reconcile facts on add (default true); false = store verbatim
   scopeKey?: string;     // explicit namespace override (e.g. a Matrix room id); from MEM0_SCOPE_KEY
-  extraReadScopes?: string[]; // extra run_ids merged into SEARCH only (read-only); from MEM0_EXTRA_READ_SCOPES
+  lockScope?: boolean;   // when scopeKey is set, force it for every call (ignore a per-call key); from MEM0_LOCK_SCOPE
+  extraReadScopes?: string[]; // extra read-only namespaces merged into recall (never written); from MEM0_EXTRA_READ_SCOPES
 }
 
 export interface MemoryHit {
@@ -93,17 +94,43 @@ export class Mem0Client {
   constructor(private readonly cfg: Mem0Config) {}
 
   /**
-   * The run_id to use for a scope. An explicit `key` (per-call arg, else the configured
-   * `scopeKey`) overrides everything and pins storage/recall to that namespace — this is
-   * how a Matrix room id scopes memory. Otherwise: `all` -> undefined (everything),
-   * `global` -> the reserved global scope, `project` -> the auto-detected project.
+   * The effective explicit namespace key for a call. With `lockScope` set (a locked-down
+   * deployment, e.g. the public bot), the configured `scopeKey` always wins and a per-call
+   * `key` is ignored, so a caller can never escape its own namespace. Otherwise a per-call
+   * `key` overrides `scopeKey`, allowing a deliberate cross-namespace operation.
+   */
+  private resolvedKey(key?: string): string | undefined {
+    if (this.cfg.lockScope && this.cfg.scopeKey) return this.cfg.scopeKey;
+    return key ?? this.cfg.scopeKey;
+  }
+
+  /**
+   * The single run_id a WRITE targets. The resolved key (see `resolvedKey`) pins storage to that
+   * namespace; this is how a Matrix room id scopes memory. Otherwise: `all` -> undefined,
+   * `global` -> the reserved global scope, `project` -> the auto-detected project. Writes never
+   * fan out over extra read scopes.
    */
   private runId(scope: Scope, key?: string): string | undefined {
-    const k = key ?? this.cfg.scopeKey;
+    const k = this.resolvedKey(key);
     if (k) return k;
     if (scope === "all") return undefined;
     if (scope === "global") return GLOBAL_SCOPE;
     return this.cfg.project;
+  }
+
+  /**
+   * The run_ids a READ fans out over: the scope's base namespace(s) plus the configured
+   * read-only `extraReadScopes` (knowledge namespaces the caller may read but never write).
+   * `mergeGlobal` reproduces search's project+global merge; list/recent keep the single base.
+   */
+  private readRunIds(scope: Scope, key: string | undefined, mergeGlobal: boolean): (string | undefined)[] {
+    const k = this.resolvedKey(key);
+    let base: (string | undefined)[];
+    if (k) base = [k];
+    else if (scope === "all") base = [undefined];
+    else if (scope === "global") base = [GLOBAL_SCOPE];
+    else base = mergeGlobal ? [this.cfg.project, GLOBAL_SCOPE] : [this.cfg.project];
+    return [...new Set([...base, ...(this.cfg.extraReadScopes ?? [])])];
   }
 
   /** Reject anything that is not a plain memory UUID before it reaches the API. */
@@ -169,19 +196,6 @@ export class Mem0Client {
   }
 
   /**
-   * The run scopes a search fans out over. An explicit `key` (per-call, else configured
-   * `scopeKey`) pins the search to that single namespace. Otherwise: 'project' spans
-   * project + global, others map 1:1.
-   */
-  private searchRunIds(scope: Scope, key?: string): (string | undefined)[] {
-    const k = key ?? this.cfg.scopeKey;
-    if (k) return [k];
-    if (scope === "all") return [undefined];
-    if (scope === "global") return [GLOBAL_SCOPE];
-    return [this.cfg.project, GLOBAL_SCOPE];
-  }
-
-  /**
    * Semantic search. Default 'project' searches the current project AND the global scope, merged,
    * so cross-project knowledge always surfaces. 'global' = global only, 'all' = everything.
    *
@@ -197,9 +211,7 @@ export class Mem0Client {
     key?: string,
   ): Promise<MemoryHit[]> {
     const queries = [query, ...extraQueries];
-    // Union the normal scope run_ids with any read-only extra knowledge scopes (e.g. a shared "k8s"
-    // knowledge base). These are SEARCH-only: add/pin/list/delete never touch them.
-    const runIds = Array.from(new Set([...this.searchRunIds(scope, key), ...(this.cfg.extraReadScopes ?? [])]));
+    const runIds = this.readRunIds(scope, key, true);
     // Widen the per-request cap so a hit ranked just outside the final top-k in one (scope, query)
     // request can still win after the union is re-ranked: each of the N queries x M scopes fetches
     // more than `limit`, then we merge, recency-re-rank, and trim to `limit` once.
@@ -229,16 +241,30 @@ export class Mem0Client {
    * With `recent: true` it returns MOST RECENT FIRST — for time-based retrieval like "the
    * last N entries". For finding what best matches a topic, use `search`, not this.
    */
-  async list(scope: Scope = "project", limit?: number, key?: string, recent = false): Promise<MemoryHit[]> {
+  /** Fetch one namespace's memories in the server's page order. */
+  private async listOne(runId: string | undefined, topK?: number): Promise<MemoryHit[]> {
     const params = new URLSearchParams({ user_id: this.cfg.defaultUserId });
-    const run = this.runId(scope, key);
-    if (run) params.set("run_id", run);
-    // For recency mode fetch a generous page then sort+trim locally (server order is not chronological).
-    if (limit !== undefined) params.set("top_k", String(recent ? Math.max(limit * 4, 50) : limit));
+    if (runId) params.set("run_id", runId);
+    if (topK !== undefined) params.set("top_k", String(topK));
     const data = await this.request(`/memories?${params.toString()}`, { method: "GET" });
-    const hits = Mem0Client.toHits(data);
-    if (!recent) return hits;
-    hits.sort((a, b) => Mem0Client.tsOf(b) - Mem0Client.tsOf(a));
+    return Mem0Client.toHits(data);
+  }
+
+  async list(scope: Scope = "project", limit?: number, key?: string, recent = false): Promise<MemoryHit[]> {
+    const runIds = this.readRunIds(scope, key, false);
+    // For recency mode fetch a generous page per namespace, then sort+trim locally (server order
+    // is not chronological).
+    const topK = limit !== undefined ? (recent ? Math.max(limit * 4, 50) : limit) : undefined;
+    const batches = await Promise.all(runIds.map((r) => this.listOne(r, topK)));
+
+    // Merge the namespaces, deduping by id so a memory shared across overlapping scopes appears once.
+    const seen = new Map<string, MemoryHit>();
+    for (const h of batches.flat()) {
+      const dedupKey = h.id ?? h.memory;
+      if (!seen.has(dedupKey)) seen.set(dedupKey, h);
+    }
+    const hits = [...seen.values()];
+    if (recent) hits.sort((a, b) => Mem0Client.tsOf(b) - Mem0Client.tsOf(a));
     return limit !== undefined ? hits.slice(0, limit) : hits;
   }
 
@@ -257,7 +283,7 @@ export class Mem0Client {
   /** The run_id holding pins for a scope. */
   private pinRun(scope: "global" | "local", key?: string): string {
     if (scope === "global") return "pins:global";
-    const k = key ?? this.cfg.scopeKey ?? this.cfg.project;
+    const k = this.resolvedKey(key) ?? this.cfg.project;
     return `pins:${k}`;
   }
 
@@ -296,8 +322,17 @@ export class Mem0Client {
       const data = await this.request(`/memories?${params.toString()}`, { method: "GET" });
       return Mem0Client.toHits(data);
     };
-    const [global, local] = await Promise.all([fetchRun("pins:global"), fetchRun(this.pinRun("local", key))]);
-    return { global, local };
+    // Local pins: this namespace's pins plus the pins of any read-only knowledge scopes.
+    const localRuns = [
+      ...new Set([this.pinRun("local", key), ...(this.cfg.extraReadScopes ?? []).map((s) => `pins:${s}`)]),
+    ];
+    const [global, ...localBatches] = await Promise.all([fetchRun("pins:global"), ...localRuns.map(fetchRun)]);
+    const seen = new Map<string, MemoryHit>();
+    for (const h of localBatches.flat()) {
+      const dk = h.id ?? h.memory;
+      if (!seen.has(dk)) seen.set(dk, h);
+    }
+    return { global, local: [...seen.values()] };
   }
 
   /** Rewrite the text of one memory by id. */
