@@ -1,6 +1,6 @@
 ---
 name: shared-memory
-description: "Use when starting any non-trivial task (recall prior context first) or after making a decision, learning a durable fact, or hitting a gotcha (store it). This is the shared cross-agent memory: the mem0 MCP tools memory_search / memory_add (mcp__mem0__*). It applies in EVERY project regardless of repo wiring or a project CLAUDE.md. This is NOT the agent's built-in file-based memory: to recall or store here, never use the Write tool, never create or edit markdown under a .claude memory directory, and never touch MEMORY.md."
+description: "Use when starting any non-trivial task (recall prior context first) or after making a decision, learning a durable fact, or hitting a gotcha (store it). This is the shared cross-agent memory: the mem0 MCP tools memory_search / memory_add, exposed under your client's prefix (e.g. mem0_memory_search). It applies in EVERY project regardless of repo wiring or a project CLAUDE.md. This is NOT the agent's built-in file-based memory: to recall or store here, never use the Write tool, never create or edit markdown under a .claude memory directory, and never touch MEMORY.md."
 ---
 
 # shared-memory
@@ -10,10 +10,25 @@ A shared memory lives in a mem0 MCP (`memory_search` / `memory_add`), auto-scope
 project so recall stays relevant. Core principle: **recall before you re-derive, remember what
 will matter next time.** Memory is optional; if it is unavailable, proceed and never block.
 
+## Tool names: use the EXACT advertised name (do not guess)
+The memory tools live on an MCP server named `mem0`. Your client exposes them under a
+**client-specific prefix built from that server name**, so the real tool names are NOT the bare
+`memory_search` / `memory_add`. Depending on the client they are, for example:
+- `mem0_memory_search`, `mem0_memory_add`, ... (most clients, e.g. pi)
+- `mcp__mem0__memory_search`, `mcp__mem0__memory_add`, ... (Claude Code)
+
+Rules to avoid wasted calls:
+- Call the tool by the **exact name your client advertises**, not the bare `memory_*` form. This
+  skill writes the tools as `memory_search` / `memory_add` for readability; prepend your client's
+  `mem0` prefix when you actually call them.
+- If a call fails with "tool not found", do NOT retry the same name. **List the `mem0` server's
+  tools once** (whatever your client's list-tools mechanism is), then call the exact name shown.
+- Never invent an un-prefixed name after you have already seen the prefixed ones.
+
 ## This is the mem0 MCP, not the file-based memory
-**Read this before you store or recall anything.** `memory_search` and `memory_add` are **MCP
-tool calls** (`mcp__mem0__memory_search`, `mcp__mem0__memory_add`, and the other `mcp__mem0__*`
-tools). You invoke them through the tool-call mechanism, exactly like any other tool.
+**Read this before you store or recall anything.** The memory operations are **MCP tool calls** on
+the `mem0` server (see the tool-name rules above for the exact names). You invoke them through the
+tool-call mechanism, exactly like any other tool.
 
 The shared memory does **not** live in files. When this skill says recall or store, that means a
 mem0 MCP tool call and nothing else:
@@ -198,7 +213,8 @@ Stop if you catch yourself doing any of these; route to the mem0 MCP tools inste
 
 ## Common mistakes
 - Writing a markdown memory file (or a `MEMORY.md` line) instead of calling `memory_add`. That
-  lands in the local file memory no other agent can see; call the `mcp__mem0__memory_add` tool.
+  lands in the local file memory no other agent can see; call the mem0 `memory_add` tool (under your
+  client's prefix, e.g. `mem0_memory_add`).
 - Skipping the pre-task recall, then re-deriving something already decided.
 - Storing a bare value with no subject (`registry.example.com`) — meaningless and unfindable later.
 - Storing session-transient state ("X not implemented yet") instead of the final fact.
