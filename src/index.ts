@@ -198,7 +198,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     switch (name) {
       case "memory_add": {
         const key = args.key ? String(args.key) : undefined;
-        const events = await client.add(String(args.text), (args.scope as Scope) ?? "project", key);
+        const fact = typeof args.text === "string" ? args.text.trim() : "";
+        if (!fact) { text = "nothing stored: `text` is required and must be non-empty"; break; }
+        const events = await client.add(fact, (args.scope as Scope) ?? "project", key);
         text = formatEvents(events);
         break;
       }
@@ -226,8 +228,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "memory_pin": {
         const key = args.key ? String(args.key) : undefined;
         const scope = (args.scope as "global" | "local") ?? "local";
-        const hits = await client.addPin(String(args.text), scope, key);
-        text = `pinned (${scope}): ${hits.map((h) => h.memory).join(" | ") || String(args.text)}`;
+        const fact = typeof args.text === "string" ? args.text.trim() : "";
+        if (!fact) { text = "nothing pinned: `text` is required and must be non-empty"; break; }
+        const hits = await client.addPin(fact, scope, key);
+        text = `pinned (${scope}): ${hits.map((h) => h.memory).filter(Boolean).join(" | ") || fact}`;
         break;
       }
       case "memory_pins": {
