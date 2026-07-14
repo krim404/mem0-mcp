@@ -68,6 +68,7 @@ export interface Mem0Config {
   insecureTls?: boolean; // skip TLS verify for self-signed certs; prefer NODE_EXTRA_CA_CERTS
   infer?: boolean;       // let mem0 extract + reconcile facts on add (default true); false = store verbatim
   scopeKey?: string;     // explicit namespace override (e.g. a Matrix room id); from MEM0_SCOPE_KEY
+  extraReadScopes?: string[]; // extra run_ids merged into SEARCH only (read-only); from MEM0_EXTRA_READ_SCOPES
 }
 
 export interface MemoryHit {
@@ -196,7 +197,9 @@ export class Mem0Client {
     key?: string,
   ): Promise<MemoryHit[]> {
     const queries = [query, ...extraQueries];
-    const runIds = this.searchRunIds(scope, key);
+    // Union the normal scope run_ids with any read-only extra knowledge scopes (e.g. a shared "k8s"
+    // knowledge base). These are SEARCH-only: add/pin/list/delete never touch them.
+    const runIds = Array.from(new Set([...this.searchRunIds(scope, key), ...(this.cfg.extraReadScopes ?? [])]));
     // Widen the per-request cap so a hit ranked just outside the final top-k in one (scope, query)
     // request can still win after the union is re-ranked: each of the N queries x M scopes fetches
     // more than `limit`, then we merge, recency-re-rank, and trim to `limit` once.

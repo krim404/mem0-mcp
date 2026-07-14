@@ -30,6 +30,8 @@ const client = new Mem0Client({
   insecureTls: process.env.MEM0_INSECURE_TLS === "1",
   infer: process.env.MEM0_INFER !== "0", // default on: let mem0 extract + reconcile facts
   scopeKey: process.env.MEM0_SCOPE_KEY || undefined, // pin all ops to one namespace (e.g. a Matrix room id)
+  // Extra read-only scopes merged into every search (comma-separated), e.g. a shared "k8s" knowledge base.
+  extraReadScopes: (process.env.MEM0_EXTRA_READ_SCOPES || "").split(",").map((s) => s.trim()).filter(Boolean),
 });
 
 const rewriteCfg = rewriteConfigFromEnv();
