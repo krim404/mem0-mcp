@@ -97,9 +97,11 @@ vs. a code/repair/task agent) and match how eagerly you use memory.
 | Store/recall in a named namespace | `memory_add(text, key="<id>")` / `memory_search(query, key="<id>")` | exactly `<id>` |
 | Inspect a scope | `memory_list(scope?, limit?)` | current project |
 | Recent entries (by time) | `memory_recent(limit?)` | most recent first |
+| Filter recall to one kind | `memory_search/list/recent(..., source="summary")` | only entries tagged that source |
 | Load always-on hard facts | `memory_pins()` | global + local pins |
-| Pin an always-on hard fact | `memory_pin(text, scope?)` | `local` (default) or `global` |
-| Remove a pin | `memory_unpin(memory_id)` | by UUID |
+| Pin a NEW always-on hard fact | `memory_pin(text, scope?)` | `local` (default) or `global` |
+| Pin an EXISTING memory in place | `memory_pin(memory_id="<uuid>")` | promotes it, keeps its text |
+| Unpin (demote to a normal memory) | `memory_unpin(memory_id)` | by UUID; fact stays |
 | Fix a stale/wrong fact | `memory_update(memory_id, text)` | by UUID |
 | Remove a fact | `memory_delete(memory_id)` | by UUID |
 | Wipe the whole store | `memory_reset(reset_token)` | ALL projects, irreversible |
@@ -125,14 +127,25 @@ Read-only knowledge scopes: a deployment may also set `MEM0_EXTRA_READ_SCOPES` s
 searches other namespaces (shared knowledge). These are read-only: writes still go only to your own
 scope. You do not pass anything for this; it is merged in automatically.
 
+## Filtering by source (machine vs. user memories)
+Entries can carry a `metadata.source` tag. `memory_search`, `memory_list` and `memory_recent` take an
+optional `source` argument that returns ONLY entries with that tag. The notable one is
+`source="summary"`: machine-generated condensations of a conversation, written automatically when a
+room goes idle (not typed by anyone). Leave `source` unset for normal recall (everything). Pass
+`source="summary"` to inspect or prune just those auto-summaries, e.g. to review what was distilled.
+
 ## Pinned hard facts (always loaded)
 Most memories surface only when semantically relevant to a search. A **pin** is different: it is a
 hard, standing fact or instruction that must be loaded on EVERY task, like reading an `AGENTS.md`.
 - **Load pins at the start of a task** with `memory_pins()` — it returns the global pins plus the
   local pins for the current namespace. Do this before `memory_search`, as the first step.
-- **Pin** with `memory_pin(text)`: stored verbatim (never reworded or reconciled), kept out of
-  normal search/list, never decayed. `scope="local"` (default) applies to this room/project;
+- **Pin a NEW fact** with `memory_pin(text)`: stored verbatim (never reworded or reconciled), kept
+  out of normal search/list, never decayed. `scope="local"` (default) applies to this room/project;
   `scope="global"` applies everywhere. Pinning the same text twice is a no-op (deduped).
+- **Pin an EXISTING memory in place** with `memory_pin(memory_id="<uuid>")`: promotes a fact you
+  already have (e.g. one that surfaced via `memory_search`/`memory_pins`) to always-load, keeping its
+  text and namespace. Use this instead of re-typing a fact you can already see. A pin is just an
+  ordinary memory tagged `metadata.pinned`, so nothing moves.
 - Use a pin for a rule that must never be missed (a hard constraint, a persona instruction, a
   standing convention). Use a normal `memory_add` for an ordinary fact that only matters when the
   topic comes up. When in doubt, `memory_add`: pins are always-on context and cost tokens every load.
@@ -142,7 +155,9 @@ hard, standing fact or instruction that must be loaded on EVERY task, like readi
 - **Ask before pinning a borderline case**: when the user clearly wants to be remembered but it is
   unclear whether it is permanent, ask first ("Is this important enough that I should remember it
   permanently?"). If it is clearly permanent, pin it directly; if clearly transient, store nothing.
-- Remove an obsolete pin with `memory_unpin(memory_id)` (the id shown by `memory_pins`).
+- **Unpin** with `memory_unpin(memory_id)` (the id shown by `memory_pins`): this DEMOTES the pin back
+  to an ordinary memory — the knowledge stays and is still recalled, it just no longer always-loads.
+  To remove it entirely, use `memory_delete`.
 
 ## Writing memories that can be found again
 Store **one self-contained declarative fact** per entry. The embedding model matches a future

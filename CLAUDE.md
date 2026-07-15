@@ -37,5 +37,6 @@ committed tree; keep them in an untracked local file.
 ## Conventions
 - TypeScript/Bun, no Python. Deps in `package.json` / `bun.lock`; `bun install` before running.
 - Keep the tool surface lean (10 tools: add/search/list/recent, pin/pins/unpin, update/delete/reset); every tool schema costs context tokens, so add a tool only when a distinct retrieval/write mode justifies it.
+- **The skill mirrors the tools.** Any change to the MCP tool surface or behavior (new/removed tool, new argument, changed semantics like pin/unpin) MUST be reflected in `skills/shared-memory/SKILL.md` in the SAME commit — the skill is what agents read to know how to call the tools, so a drift silently teaches wrong usage. Update its quick-reference table and the relevant prose section.
 - Never store secrets in memory. `memory_reset` needs the user's token — never invent one.
 - No em/en dashes in prose. Short one-sentence commit messages, no prefixes, no generated-by trailers.
