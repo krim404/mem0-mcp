@@ -24,6 +24,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Mem0Client, detectProject, type MemoryHit, type Scope } from "./mem0";
 import { rewriteConfigFromEnv, rewriteQuery } from "./rewrite";
+import { computeExpirationDate } from "./expiry";
 
 const PROJECT = detectProject();
 
@@ -69,7 +70,7 @@ const TOOLS = [
   {
     name: "memory_add",
     description:
-      "Store one durable, self-contained fact/decision in shared memory. mem0 extracts the fact and reconciles it against existing memories (dedupes, updates a contradicted entry); the result reports what changed.",
+      "Store one durable, self-contained fact/decision in shared memory. mem0 extracts the fact and reconciles it against existing memories (dedupes, updates a contradicted entry); the result reports what changed. Decide permanence: leave permanent by default (why-decisions, identity, standing conventions); set expires_in_days for TEMPORARY facts (work just done, a bug that used to exist, current status) so they fade automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -80,6 +81,11 @@ const TOOLS = [
         },
         scope: STORE_SCOPE,
         key: KEY_PROP,
+        expires_in_days: {
+          type: "number",
+          description:
+            "Optional. Mark this fact TEMPORARY: it expires this many days from now, after which it sinks in recall, then drops out (~1 month), then is deleted (~6 months). Omit for permanent facts.",
+        },
       },
       required: ["text"],
     },
@@ -232,7 +238,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     switch (name) {
       case "memory_add": {
         const key = args.key ? String(args.key) : undefined;
-        const events = await client.add(requireText(args), (args.scope as Scope) ?? "project", key);
+        const days = Number(args.expires_in_days);
+        const expiration = Number.isFinite(days) && days > 0 ? computeExpirationDate(days) : undefined;
+        const events = await client.add(requireText(args), (args.scope as Scope) ?? "project", key, expiration);
         text = formatEvents(events);
         break;
       }

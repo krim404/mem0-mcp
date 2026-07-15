@@ -94,6 +94,7 @@ vs. a code/repair/task agent) and match how eagerly you use memory.
 | Recall everything | `memory_search(query, scope="all")` | all projects |
 | Store project fact | `memory_add(text)` | current project |
 | Store cross-project fact | `memory_add(text, scope="global")` | global |
+| Store a TEMPORARY fact | `memory_add(text, expires_in_days=N)` | expires, then fades and is GC'd |
 | Store/recall in a named namespace | `memory_add(text, key="<id>")` / `memory_search(query, key="<id>")` | exactly `<id>` |
 | Inspect a scope | `memory_list(scope?, limit?)` | current project |
 | Recent entries (by time) | `memory_recent(limit?)` | most recent first |
@@ -131,8 +132,9 @@ scope. You do not pass anything for this; it is merged in automatically.
 Entries can carry a `metadata.source` tag. `memory_search`, `memory_list` and `memory_recent` take an
 optional `source` argument that returns ONLY entries with that tag. The notable one is
 `source="summary"`: machine-generated condensations of a conversation, written automatically when a
-room goes idle (not typed by anyone). Leave `source` unset for normal recall (everything). Pass
-`source="summary"` to inspect or prune just those auto-summaries, e.g. to review what was distilled.
+room goes idle (not typed by anyone). These carry a default expiry (they condense transient work), so
+they fade on their own unless the conversation keeps them fresh. Leave `source` unset for normal
+recall (everything). Pass `source="summary"` to inspect or prune just those auto-summaries.
 
 ## Pinned hard facts (always loaded)
 Most memories surface only when semantically relevant to a search. A **pin** is different: it is a
@@ -179,6 +181,21 @@ reports what changed (`ADD` / `UPDATE` / `DELETE`, or "no change" when nothing n
 it was a duplicate). So you do not need to hunt down and hand-edit an older entry that your new fact
 supersedes: add the correct current fact and let reconciliation retire the stale one. Read the
 result to confirm it landed the way you expected.
+
+## Temporary vs. permanent: expiring memories
+When you store a fact, DECIDE whether it is durable or temporary, and set an expiry on the temporary
+ones so the store does not fill with stale detail.
+- **Permanent (no expiry, the default)**: the reasons WHY something was built or decided, identity,
+  standing preferences, lasting conventions — facts that will still matter next year.
+- **Temporary (`memory_add(text, expires_in_days=N)`)**: work that was just done, a bug that used to
+  exist and is now fixed, the current status of something in flight, a passing situation. Pick a
+  horizon that matches how long it stays true (a few days for a task note, weeks for a transient
+  arrangement).
+- **What expiry does** (so you understand why old temporary facts disappear from recall): once past
+  its date a fact first sinks to the bottom of recall, after ~1 month it stops appearing at all, and
+  after ~6 months it is deleted. Nothing you must trigger — it fades on its own.
+- When unsure, prefer permanent for genuine knowledge and an expiry for anything that reads like a
+  status update. A permanent fact that later turns out transient can always be re-added with an expiry.
 
 ## Store only final facts
 Never store state that is expected to change within the session. If the task is to implement X,

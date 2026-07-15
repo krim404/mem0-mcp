@@ -10,6 +10,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { basename } from "node:path";
+import { classifyExpiry } from "./expiry";
 
 export type Scope = "project" | "global" | "all";
 export const GLOBAL_SCOPE = "global";
@@ -80,6 +81,7 @@ export interface MemoryHit {
   updatedAt?: string;
   event?: string;     // add-time reconciliation outcome: ADD | UPDATE | DELETE | NONE (infer mode)
   metadata?: Record<string, unknown>; // stored tags (e.g. { source: "summary" }); used for filtering
+  expirationDate?: string; // YYYY-MM-DD after which the memory is expired (drives the expiry tiers)
 }
 
 /** Recency factor in [DECAY_FLOOR, 1] for an entry's age; missing timestamp => 1 (no penalty). */
@@ -169,6 +171,7 @@ export class Mem0Client {
       updatedAt: r.updated_at ?? undefined,
       event: r.event ?? undefined,
       metadata: r.metadata ?? undefined,
+      expirationDate: r.expiration_date ?? undefined,
     }));
   }
 
@@ -178,7 +181,7 @@ export class Mem0Client {
    * its own. Set infer=false (MEM0_INFER=0) to store the text verbatim without that pipeline.
    * Returns one hit per reconciliation event so the caller can see what changed.
    */
-  async add(text: string, scope: Scope = "project", key?: string): Promise<MemoryHit[]> {
+  async add(text: string, scope: Scope = "project", key?: string, expirationDate?: string): Promise<MemoryHit[]> {
     const body: Record<string, unknown> = {
       messages: [{ role: "user", content: text }],
       user_id: this.cfg.defaultUserId,
@@ -186,12 +189,15 @@ export class Mem0Client {
     };
     const run = this.runId(scope === "all" ? "project" : scope, key); // never add without a scope
     if (run) body.run_id = run;
+    if (expirationDate) body.expiration_date = expirationDate;
     const data = await this.request("/memories", { method: "POST", body: JSON.stringify(body) }, ADD_TIMEOUT_MS);
     return Mem0Client.toHits(data);
   }
 
   private async searchScope(query: string, runId: string | undefined, limit: number): Promise<MemoryHit[]> {
-    const body: Record<string, unknown> = { query, user_id: this.cfg.defaultUserId, limit };
+    // show_expired: fetch expired rows too, so we can apply our own graded expiry tiers (the server
+    // would otherwise hide them outright, making "recently expired, shown at the bottom" impossible).
+    const body: Record<string, unknown> = { query, user_id: this.cfg.defaultUserId, limit, show_expired: true };
     if (runId) body.run_id = runId;
     const data = await this.request("/search", { method: "POST", body: JSON.stringify(body) });
     return Mem0Client.toHits(data);
@@ -231,13 +237,10 @@ export class Mem0Client {
       if (!prev || (hit.score ?? 0) > (prev.score ?? 0)) best.set(dedupKey, hit);
     }
 
-    return Mem0Client.bySource([...best.values()], source)
-      .filter((h) => !Mem0Client.isPinned(h)) // pins surface only via listPins, never in recall
-      .sort((a, b) => {
-        const adj = (h: MemoryHit) => (h.score ?? 0) * recencyFactor(h.updatedAt ?? h.createdAt);
-        return adj(b) - adj(a);
-      })
-      .slice(0, limit);
+    const merged = Mem0Client.bySource([...best.values()], source)
+      .filter((h) => !Mem0Client.isPinned(h)); // pins surface only via listPins, never in recall
+    const adj = (h: MemoryHit) => (h.score ?? 0) * recencyFactor(h.updatedAt ?? h.createdAt);
+    return this.tierAndTrim(merged, limit, (a, b) => adj(b) - adj(a));
   }
 
   /** Keep only hits tagged with the given metadata `source` (no filter when source is unset). */
@@ -247,13 +250,49 @@ export class Mem0Client {
   }
 
   /**
+   * Apply the expiry lifecycle to a result set: drop `hidden`, GC `dead` (best-effort, off the hot
+   * path), keep `active` above `recent` (freshly-expired sink to the bottom). `rank` sorts within
+   * each group; omit it to preserve the incoming order (list inspection). Trims to `limit`.
+   */
+  private tierAndTrim(hits: MemoryHit[], limit?: number, rank?: (a: MemoryHit, b: MemoryHit) => number): MemoryHit[] {
+    const active: MemoryHit[] = [];
+    const recent: MemoryHit[] = [];
+    const dead: string[] = [];
+    for (const h of hits) {
+      const tier = classifyExpiry(h.expirationDate);
+      if (tier === "active") active.push(h);
+      else if (tier === "recent") recent.push(h);
+      else if (tier === "dead" && h.id) dead.push(h.id);
+      // `hidden`: kept in the store but omitted from recall.
+    }
+    if (dead.length) void this.gcDead(dead);
+    if (rank) {
+      active.sort(rank);
+      recent.sort(rank);
+    }
+    const out = [...active, ...recent];
+    return limit !== undefined ? out.slice(0, limit) : out;
+  }
+
+  /** Garbage-collect memories long past expiry (delete). Best-effort: never blocks a read or throws. */
+  private async gcDead(ids: string[]): Promise<void> {
+    for (const id of ids) {
+      try {
+        await this.remove(id);
+      } catch {
+        /* best-effort GC: a failed delete is retried on the next read */
+      }
+    }
+  }
+
+  /**
    * List memories for a scope. By default returns the server's page order (for inspection).
    * With `recent: true` it returns MOST RECENT FIRST — for time-based retrieval like "the
    * last N entries". For finding what best matches a topic, use `search`, not this.
    */
   /** Fetch one namespace's memories in the server's page order. */
   private async listOne(runId: string | undefined, topK?: number): Promise<MemoryHit[]> {
-    const params = new URLSearchParams({ user_id: this.cfg.defaultUserId });
+    const params = new URLSearchParams({ user_id: this.cfg.defaultUserId, show_expired: "true" });
     if (runId) params.set("run_id", runId);
     if (topK !== undefined) params.set("top_k", String(topK));
     const data = await this.request(`/memories?${params.toString()}`, { method: "GET" });
@@ -262,10 +301,9 @@ export class Mem0Client {
 
   async list(scope: Scope = "project", limit?: number, key?: string, recent = false, source?: string): Promise<MemoryHit[]> {
     const runIds = this.readRunIds(scope, key, false);
-    // For recency mode (and when filtering by source) fetch a generous page per namespace, then
-    // sort/filter/trim locally (server order is not chronological, and a small `limit` must not
-    // starve the source filter of candidates).
-    const topK = limit !== undefined ? (recent || source ? Math.max(limit * 4, 50) : limit) : undefined;
+    // Fetch a generous page per namespace, then filter/sort/trim locally: server order is not
+    // chronological, and the source/pin/expiry filters must not be starved by a small `limit`.
+    const topK = limit !== undefined ? Math.max(limit * 4, 50) : undefined;
     const batches = await Promise.all(runIds.map((r) => this.listOne(r, topK)));
 
     // Merge the namespaces, deduping by id so a memory shared across overlapping scopes appears once.
@@ -274,9 +312,10 @@ export class Mem0Client {
       const dedupKey = h.id ?? h.memory;
       if (!seen.has(dedupKey)) seen.set(dedupKey, h);
     }
-    const hits = Mem0Client.bySource([...seen.values()], source).filter((h) => !Mem0Client.isPinned(h));
-    if (recent) hits.sort((a, b) => Mem0Client.tsOf(b) - Mem0Client.tsOf(a));
-    return limit !== undefined ? hits.slice(0, limit) : hits;
+    const merged = Mem0Client.bySource([...seen.values()], source).filter((h) => !Mem0Client.isPinned(h));
+    // Recent mode ranks by recency; plain inspection keeps the server page order.
+    const rank = recent ? (a: MemoryHit, b: MemoryHit) => Mem0Client.tsOf(b) - Mem0Client.tsOf(a) : undefined;
+    return this.tierAndTrim(merged, limit, rank);
   }
 
   /** Epoch ms of a hit's most recent timestamp (0 when absent). */

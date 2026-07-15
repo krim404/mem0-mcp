@@ -27,6 +27,12 @@ rewriter uses `MEM0_REWRITE_BASE_URL` / `MEM0_REWRITE_MODEL`. Scoping via mem0 `
   guillotine.
 - **Storage doctrine**: one self-contained declarative fact per entry, name the subject, never a
   bare value. Do NOT store the question (the model handles question/answer asymmetry at query time).
+- **Expiry tiers** (`src/expiry.ts`): a memory may carry `expiration_date` (YYYY-MM-DD; `memory_add`
+  takes a relative `expires_in_days` and computes it). The server hides expired rows unless
+  `show_expired=true`; the bridge always asks with `show_expired=true` and applies its own lifecycle:
+  active → recent (1..30d past: shown but sunk to the bottom) → hidden (…180d: filtered from recall)
+  → dead (>180d: deleted). GC is lazy — `search`/`list` delete `dead` rows they encounter
+  (best-effort, off the hot path). mem0 never deletes on its own. Pins never expire.
 
 ## Server-side note
 For fact extraction to keep technical detail (paths, hostnames, versions) instead of rewriting into
