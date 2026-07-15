@@ -59,6 +59,11 @@ const KEY_PROP = {
   description:
     "Optional namespace key (e.g. a Matrix room id). When set, pins storage/recall to exactly that namespace, overriding `scope`. Leave unset for normal project/global scoping. When the server already has a scope configured (a room deployment), leave it unset too; only pass it to deliberately target a different namespace.",
 };
+const SOURCE_PROP = {
+  type: "string",
+  description:
+    "Optional metadata filter. When set, return ONLY memories tagged with this source, e.g. 'summary' for machine-generated idle-conversation summaries. Leave unset to include everything.",
+};
 
 const TOOLS = [
   {
@@ -90,16 +95,17 @@ const TOOLS = [
         scope: READ_SCOPE,
         limit: { type: "number", description: "Max results (default 5)." },
         key: KEY_PROP,
+        source: SOURCE_PROP,
       },
       required: ["query"],
     },
   },
   {
     name: "memory_list",
-    description: "List memories in a scope (server-capped page; use memory_search for semantic recall).",
+    description: "List memories in a scope (server-capped page; use memory_search for semantic recall). Pass `source` to list only one kind (e.g. machine summaries).",
     inputSchema: {
       type: "object",
-      properties: { scope: READ_SCOPE, limit: { type: "number" }, key: KEY_PROP },
+      properties: { scope: READ_SCOPE, limit: { type: "number" }, key: KEY_PROP, source: SOURCE_PROP },
       required: [],
     },
   },
@@ -109,22 +115,23 @@ const TOOLS = [
       "Return the MOST RECENT memories first (time-based, e.g. 'the last 10 entries'). Distinct from memory_search (relevance) and memory_list (inspection). Good for recovering recent context when there is no specific query.",
     inputSchema: {
       type: "object",
-      properties: { scope: READ_SCOPE, limit: { type: "number", description: "How many recent entries (default 10)." }, key: KEY_PROP },
+      properties: { scope: READ_SCOPE, limit: { type: "number", description: "How many recent entries (default 10)." }, key: KEY_PROP, source: SOURCE_PROP },
       required: [],
     },
   },
   {
     name: "memory_pin",
     description:
-      "Pin a HARD, always-relevant fact (AGENTS.md-like) that must be surfaced on EVERY load, not just when semantically relevant. Stored verbatim, kept out of normal search/recall. scope 'global' = applies everywhere; 'local' = only this namespace (room/project).",
+      "Pin a HARD, always-relevant fact (AGENTS.md-like) that must be surfaced on EVERY load, not just when semantically relevant. Kept out of normal search/recall. Pass `text` to pin a NEW verbatim fact, OR `memory_id` to pin an EXISTING memory in place (promote it to always-load, keeping its text). scope 'global' = applies everywhere; 'local' = only this namespace (room/project).",
     inputSchema: {
       type: "object",
       properties: {
-        text: { type: "string", description: "The hard fact / instruction to always load." },
-        scope: { type: "string", enum: ["global", "local"], description: "'local' (default, this room/project) or 'global' (everywhere)." },
+        text: { type: "string", description: "The hard fact / instruction to always load (for a NEW pin). Omit when pinning an existing memory via memory_id." },
+        memory_id: { type: "string", description: "UUID of an EXISTING memory to pin in place (mutually exclusive with text)." },
+        scope: { type: "string", enum: ["global", "local"], description: "'local' (default, this room/project) or 'global' (everywhere). Only for a new pin." },
         key: KEY_PROP,
       },
-      required: ["text"],
+      required: [],
     },
   },
   {
@@ -135,7 +142,7 @@ const TOOLS = [
   },
   {
     name: "memory_unpin",
-    description: "Remove a pinned fact by its UUID (as shown by memory_pins).",
+    description: "Unpin a fact by its UUID (as shown by memory_pins): demotes it back to an ordinary memory (the knowledge stays, it just no longer always-loads). Use memory_delete to remove it entirely.",
     inputSchema: { type: "object", properties: { memory_id: { type: "string" } }, required: ["memory_id"] },
   },
   {
@@ -232,25 +239,35 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "memory_search": {
         const query = String(args.query);
         const key = args.key ? String(args.key) : undefined;
+        const source = args.source ? String(args.source) : undefined;
         // HyDE-lite: search the raw question AND a declarative rewrite of it (best-effort).
         const rewritten = await rewriteQuery(query, rewriteCfg);
         const extra = rewritten ? [rewritten] : [];
         text = formatHits(
-          await client.search(query, (args.scope as Scope) ?? "project", (args.limit as number) ?? 5, extra, key),
+          await client.search(query, (args.scope as Scope) ?? "project", (args.limit as number) ?? 5, extra, key, source),
         );
         break;
       }
       case "memory_list": {
         const key = args.key ? String(args.key) : undefined;
-        text = formatHits(await client.list((args.scope as Scope) ?? "project", args.limit as number | undefined, key));
+        const source = args.source ? String(args.source) : undefined;
+        text = formatHits(await client.list((args.scope as Scope) ?? "project", args.limit as number | undefined, key, false, source));
         break;
       }
       case "memory_recent": {
         const key = args.key ? String(args.key) : undefined;
-        text = formatHits(await client.list((args.scope as Scope) ?? "project", (args.limit as number) ?? 10, key, true));
+        const source = args.source ? String(args.source) : undefined;
+        text = formatHits(await client.list((args.scope as Scope) ?? "project", (args.limit as number) ?? 10, key, true, source));
         break;
       }
       case "memory_pin": {
+        if (args.memory_id) {
+          // Promote an EXISTING memory to a pin in place (retroactively pin known knowledge).
+          const id = String(args.memory_id);
+          await client.pinExisting(id);
+          text = `pinned existing memory ${id}`;
+          break;
+        }
         const key = args.key ? String(args.key) : undefined;
         const scope = (args.scope as "global" | "local") ?? "local";
         const fact = requireText(args);
@@ -268,8 +285,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         break;
       }
       case "memory_unpin":
-        await client.remove(String(args.memory_id));
-        text = `unpinned ${args.memory_id}`;
+        await client.unpinExisting(String(args.memory_id));
+        text = `unpinned (demoted to a normal memory) ${args.memory_id}`;
         break;
       case "memory_update":
         await client.update(String(args.memory_id), requireText(args));

@@ -79,6 +79,7 @@ export interface MemoryHit {
   createdAt?: string; // ISO timestamp from the server, when present
   updatedAt?: string;
   event?: string;     // add-time reconciliation outcome: ADD | UPDATE | DELETE | NONE (infer mode)
+  metadata?: Record<string, unknown>; // stored tags (e.g. { source: "summary" }); used for filtering
 }
 
 /** Recency factor in [DECAY_FLOOR, 1] for an entry's age; missing timestamp => 1 (no penalty). */
@@ -167,6 +168,7 @@ export class Mem0Client {
       createdAt: r.created_at ?? undefined,
       updatedAt: r.updated_at ?? undefined,
       event: r.event ?? undefined,
+      metadata: r.metadata ?? undefined,
     }));
   }
 
@@ -209,6 +211,7 @@ export class Mem0Client {
     limit = 5,
     extraQueries: string[] = [],
     key?: string,
+    source?: string,
   ): Promise<MemoryHit[]> {
     const queries = [query, ...extraQueries];
     const runIds = this.readRunIds(scope, key, true);
@@ -228,12 +231,19 @@ export class Mem0Client {
       if (!prev || (hit.score ?? 0) > (prev.score ?? 0)) best.set(dedupKey, hit);
     }
 
-    return [...best.values()]
+    return Mem0Client.bySource([...best.values()], source)
+      .filter((h) => !Mem0Client.isPinned(h)) // pins surface only via listPins, never in recall
       .sort((a, b) => {
         const adj = (h: MemoryHit) => (h.score ?? 0) * recencyFactor(h.updatedAt ?? h.createdAt);
         return adj(b) - adj(a);
       })
       .slice(0, limit);
+  }
+
+  /** Keep only hits tagged with the given metadata `source` (no filter when source is unset). */
+  private static bySource(hits: MemoryHit[], source?: string): MemoryHit[] {
+    if (!source) return hits;
+    return hits.filter((h) => String(h.metadata?.source ?? "") === source);
   }
 
   /**
@@ -250,11 +260,12 @@ export class Mem0Client {
     return Mem0Client.toHits(data);
   }
 
-  async list(scope: Scope = "project", limit?: number, key?: string, recent = false): Promise<MemoryHit[]> {
+  async list(scope: Scope = "project", limit?: number, key?: string, recent = false, source?: string): Promise<MemoryHit[]> {
     const runIds = this.readRunIds(scope, key, false);
-    // For recency mode fetch a generous page per namespace, then sort+trim locally (server order
-    // is not chronological).
-    const topK = limit !== undefined ? (recent ? Math.max(limit * 4, 50) : limit) : undefined;
+    // For recency mode (and when filtering by source) fetch a generous page per namespace, then
+    // sort/filter/trim locally (server order is not chronological, and a small `limit` must not
+    // starve the source filter of candidates).
+    const topK = limit !== undefined ? (recent || source ? Math.max(limit * 4, 50) : limit) : undefined;
     const batches = await Promise.all(runIds.map((r) => this.listOne(r, topK)));
 
     // Merge the namespaces, deduping by id so a memory shared across overlapping scopes appears once.
@@ -263,7 +274,7 @@ export class Mem0Client {
       const dedupKey = h.id ?? h.memory;
       if (!seen.has(dedupKey)) seen.set(dedupKey, h);
     }
-    const hits = [...seen.values()];
+    const hits = Mem0Client.bySource([...seen.values()], source).filter((h) => !Mem0Client.isPinned(h));
     if (recent) hits.sort((a, b) => Mem0Client.tsOf(b) - Mem0Client.tsOf(a));
     return limit !== undefined ? hits.slice(0, limit) : hits;
   }
@@ -274,29 +285,31 @@ export class Mem0Client {
     return Number.isNaN(t) ? 0 : t;
   }
 
-  // ── Pinned facts (AGENTS.md-like: always loaded, verbatim, kept out of normal recall) ──────
+  // ── Pinned facts (AGENTS.md-like: always loaded, kept out of normal recall) ──────
   //
-  // Pins live in dedicated namespaces so they never pollute semantic search/list and are never
-  // decayed or reconciled: `pins:global` (cross-scope) and `pins:<key>` (local to a room/project).
-  // They are stored verbatim (infer:false) so the exact text is preserved.
+  // A pin is an ordinary memory in its NORMAL namespace (the room/project scope, or global) tagged
+  // `metadata.pinned=true` and stored verbatim (infer:false). Living in the normal namespace lets an
+  // EXISTING memory be pinned in place by flipping the flag (no move/copy); the pinned tag keeps pins
+  // out of semantic search/list (they surface only via listPins) and marks them as the always-load set.
 
-  /** The run_id holding pins for a scope. */
+  /** True for a pinned memory. */
+  private static isPinned(h: MemoryHit): boolean {
+    return h.metadata?.pinned === true;
+  }
+
+  /** The base run_id a pin lives in: the global scope, or the local room/project namespace. */
   private pinRun(scope: "global" | "local", key?: string): string {
-    if (scope === "global") return "pins:global";
-    const k = this.resolvedKey(key) ?? this.cfg.project;
-    return `pins:${k}`;
+    return scope === "global" ? GLOBAL_SCOPE : (this.resolvedKey(key) ?? this.cfg.project);
   }
 
   /**
-   * Add a pinned fact verbatim (never inferred/reconciled). Deduped: since pins are stored exactly
-   * as written and loaded on every recall, an identical pin (same trimmed text) already in the run
-   * is returned as-is instead of creating a second copy. Returns the stored (or existing) hits.
+   * Add a NEW pinned fact verbatim in its namespace (never inferred/reconciled), tagged pinned.
+   * Deduped against an existing pin with the same trimmed text in that namespace.
    */
   async addPin(text: string, scope: "global" | "local", key?: string): Promise<MemoryHit[]> {
     const runId = this.pinRun(scope, key);
     const wanted = text.trim();
-    const params = new URLSearchParams({ user_id: this.cfg.defaultUserId, run_id: runId, top_k: "200" });
-    const existing = Mem0Client.toHits(await this.request(`/memories?${params.toString()}`, { method: "GET" }));
+    const existing = (await this.listOne(runId, 200)).filter(Mem0Client.isPinned);
     const dup = existing.find((h) => h.memory.trim() === wanted);
     if (dup) return [dup];
 
@@ -312,33 +325,43 @@ export class Mem0Client {
     return Mem0Client.toHits(data);
   }
 
+  /** Pin an EXISTING memory in place by id (flip metadata.pinned=true), keeping its text/namespace. */
+  async pinExisting(memoryId: string): Promise<void> {
+    await this.update(memoryId, undefined, { pinned: true });
+  }
+
+  /** Demote a pinned memory back to an ordinary one (metadata.pinned=false); the knowledge stays. */
+  async unpinExisting(memoryId: string): Promise<void> {
+    await this.update(memoryId, undefined, { pinned: false });
+  }
+
   /**
-   * All pinned facts that apply right now: the global pins plus the local pins for `key`
-   * (or the configured scopeKey / project). Returned in full — this is the always-load set.
+   * All pinned facts that apply right now: the global pins plus the pins for `key` (or the configured
+   * scopeKey / project) and any read-only knowledge scopes. Read from the NORMAL namespaces and
+   * filtered to pinned. This is the always-load set.
    */
   async listPins(key?: string): Promise<{ global: MemoryHit[]; local: MemoryHit[] }> {
-    const fetchRun = async (runId: string): Promise<MemoryHit[]> => {
-      const params = new URLSearchParams({ user_id: this.cfg.defaultUserId, run_id: runId, top_k: "200" });
-      const data = await this.request(`/memories?${params.toString()}`, { method: "GET" });
-      return Mem0Client.toHits(data);
-    };
-    // Local pins: this namespace's pins plus the pins of any read-only knowledge scopes.
-    const localRuns = [
-      ...new Set([this.pinRun("local", key), ...(this.cfg.extraReadScopes ?? []).map((s) => `pins:${s}`)]),
-    ];
-    const [global, ...localBatches] = await Promise.all([fetchRun("pins:global"), ...localRuns.map(fetchRun)]);
+    const localRuns = [...new Set([this.pinRun("local", key), ...(this.cfg.extraReadScopes ?? [])])];
+    const [globalHits, ...localBatches] = await Promise.all([
+      this.listOne(GLOBAL_SCOPE, 200),
+      ...localRuns.map((r) => this.listOne(r, 200)),
+    ]);
+    const global = globalHits.filter(Mem0Client.isPinned);
     const seen = new Map<string, MemoryHit>();
-    for (const h of localBatches.flat()) {
+    for (const h of localBatches.flat().filter(Mem0Client.isPinned)) {
       const dk = h.id ?? h.memory;
       if (!seen.has(dk)) seen.set(dk, h);
     }
     return { global, local: [...seen.values()] };
   }
 
-  /** Rewrite the text of one memory by id. */
-  async update(memoryId: string, text: string): Promise<void> {
+  /** Update a memory by id: rewrite text and/or replace metadata (only provided fields are sent). */
+  async update(memoryId: string, text?: string, metadata?: Record<string, unknown>): Promise<void> {
     Mem0Client.assertMemoryId(memoryId);
-    await this.request(`/memories/${memoryId}`, { method: "PUT", body: JSON.stringify({ text }) });
+    const body: Record<string, unknown> = {};
+    if (text !== undefined) body.text = text;
+    if (metadata !== undefined) body.metadata = metadata;
+    await this.request(`/memories/${memoryId}`, { method: "PUT", body: JSON.stringify(body) });
   }
 
   /** Delete one memory by id. */
