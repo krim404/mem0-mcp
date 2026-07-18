@@ -233,6 +233,19 @@ catch on its own:
 Note: `memory_list` returns a server-capped page, not the full store; use `memory_search`
 for recall. If a memory tool errors, continue the task without memory.
 
+## Network / reachability: HTTP 403 can mean you are outside the VPN/LAN
+A self-hosted mem0 backend may be reachable **only from inside a private network (VPN/LAN)**. In
+such a setup the endpoint's public name resolves (via DNS split-horizon) to a reverse proxy that
+**deliberately returns HTTP 403** to outside clients, while only internal clients reach the real
+backend.
+
+So if a memory tool fails with **HTTP 403** (or a connection refused / timeout reaching the mem0
+endpoint), you are most likely **not connected to the required VPN/LAN**. When that happens:
+- **Tell the user plainly**, e.g. "No access to mem0 (403) — you are probably not on the VPN/LAN."
+  Do not treat it as a mem0 outage or a code bug.
+- Then **continue the task without memory** — memory is optional and must never block work.
+- Do not retry in a loop or fall back to the file-based memory; just proceed once and mention it.
+
 ## Red flags: you are about to use the wrong memory
 Stop if you catch yourself doing any of these; route to the mem0 MCP tools instead.
 - Reaching for the **Write tool** to save a fact, or picking a `.md` file path for it.

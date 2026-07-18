@@ -156,7 +156,10 @@ export class Mem0Client {
     const res = await fetch(`${this.cfg.baseUrl}${path}`, opts);
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw new Error(`mem0 ${init.method ?? "GET"} ${path} -> ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
+      // A 403 from the public reverse proxy means the client is outside the VPN/LAN: mem0 is
+      // internal-only and pi5/nginx-prim refuses external access. Surface that as a hint.
+      const hint = res.status === 403 ? " (403: likely outside the VPN/LAN — mem0 is internal-only)" : "";
+      throw new Error(`mem0 ${init.method ?? "GET"} ${path} -> ${res.status} ${res.statusText}${hint} ${body.slice(0, 200)}`);
     }
     return res.status === 204 ? null : res.json();
   }
